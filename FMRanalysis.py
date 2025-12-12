@@ -33,9 +33,36 @@ def dlorentz_dx(x, A, x0, gamma, C):
     g2 = (gamma / 2.0) ** 2
     return C + A * (-2.0) * g2 * (x - x0) / (((x - x0) ** 2 + g2) ** 2)
 
+def lorentz_asym(B, c_sym, c_asym, B_res, dB, c0):
+    """
+    L(B) = c_sym * ( (dB/2)^2 / ( (dB/2)^2 + (B-B_res)^2 ) )
+         + c_asym* ( (dB/2)*(B-B_res) / ( (dB/2)^2 + (B-B_res)^2 ) )
+         + c0
+    """
+    x = B - B_res
+    g = dB / 2.0
+    D = g**2 + x**2
+    return c0 + c_sym * (g**2 / D) + c_asym * (g * x / D)
+
+
+def dlorentz_asym_dB(B, c_sym, c_asym, B_res, dB, C):
+    """
+    d/dB of lorentz_asym (with its own constant offset C).
+    """
+    x = B - B_res
+    g = dB / 2.0
+    D = g**2 + x**2
+
+    d_sym  = -2.0 * c_sym  * g**2 * x / (D**2)
+    d_asym =        c_asym * g * (g**2 - x**2) / (D**2)
+
+    return C + d_sym + d_asym
+
 MODEL_FUNCS = {
     "Derivative of Lorentz (dispersion-like)": dlorentz_dx,
     "Lorentz (absorption)": lorentz,
+    "Derivative of assymetric Lorentz (dispersion-like)": dlorentz_asym_dB,
+    "Assymetric Lorentz (absorption)": lorentz_asym,
 }
 
 # =========================
@@ -123,6 +150,9 @@ class FitState:
     x0_init: float
     gamma_init: float
     C_init: float
+    c_asym_init: float = 0.0
+    c_asym: Optional[float] = None
+    c_asym_unc: Optional[float] = None
     # results
     A: Optional[float] = None
     x0: Optional[float] = None
@@ -332,7 +362,7 @@ class FMRFitApp(tk.Tk):
                 self.fits[p] = FitState(
                     file_path=p, file_name=fname, x=x, y=y, mask=mask,
                     model=model, freq_GHz=freq,
-                    A_init=A0, x0_init=x00, gamma_init=g0, C_init=C0
+                    A_init=A0, x0_init=x00, gamma_init=g0, C_init=C0, c_asym_init=0.0
                 )
             except Exception as e:
                 messagebox.showerror("Load failed", f"{p}\n\n{e}")
@@ -430,24 +460,71 @@ class FMRFitApp(tk.Tk):
             if xm.size < 4:
                 raise ValueError("Not enough unmasked points to fit (need ≥ 4).")
 
-            lower = [-abs(self.max_abs_A.get()), -np.inf, max(self.min_gamma.get(), 1e-12), -np.inf]
-            upper = [ abs(self.max_abs_A.get()),  np.inf, np.inf,                          np.inf]
-            popt, pcov = curve_fit(
-                f, xm, ym,
-                p0=[fs.A_init, fs.x0_init, fs.gamma_init, fs.C_init],
-                bounds=(lower, upper),
-                maxfev=10000
+            is_asym = fs.model in (
+                "Assymetric Lorentz (absorption)",
+                "Derivative of assymetric Lorentz (dispersion-like)",
             )
-            fs.A, fs.x0, fs.gamma, fs.C = map(float, popt)
-            yfit_full = f(fs.x, *popt)
-            fs.R2 = float(r2(fs.y, yfit_full))
 
-            # --- 95% uncertainties (±) ---
-            se = np.sqrt(np.diag(pcov))
-            dof = max(1, xm.size - len(popt))
-            tcrit = student_t.ppf(0.975, dof)  # two-sided 95%
-            unc = tcrit * se
-            fs.A_unc, fs.x0_unc, fs.gamma_unc = float(unc[0]), float(unc[1]), float(unc[2])
+            if not is_asym:
+                # ---- 4-param models ----
+                p0 = [fs.A_init, fs.x0_init, fs.gamma_init, fs.C_init]
+                lower = [-abs(self.max_abs_A.get()), -np.inf, max(self.min_gamma.get(), 1e-12), -np.inf]
+                upper = [ abs(self.max_abs_A.get()),  np.inf, np.inf,                          np.inf]
+
+                popt, pcov = curve_fit(f, xm, ym, p0=p0, bounds=(lower, upper), maxfev=10000)
+
+                fs.A, fs.x0, fs.gamma, fs.C = map(float, popt)
+                fs.c_asym = None
+                fs.c_asym_unc = None
+
+                yfit_full = f(fs.x, *popt)
+
+                # uncertainties
+                se = np.sqrt(np.diag(pcov))
+                dof = max(1, xm.size - len(popt))
+                tcrit = student_t.ppf(0.975, dof)
+                unc = tcrit * se
+                fs.A_unc, fs.x0_unc, fs.gamma_unc = float(unc[0]), float(unc[1]), float(unc[2])
+
+            else:
+                # ---- 5-param asymmetric models ----
+                p0 = [fs.A_init, fs.c_asym_init, fs.x0_init, fs.gamma_init, fs.C_init]
+                lower = [
+                    -abs(self.max_abs_A.get()),     # c_sym
+                    -abs(self.max_abs_A.get()),     # c_asym
+                    -np.inf,                        # B_res
+                    max(self.min_gamma.get(), 1e-12),  # dB > 0
+                    -np.inf                         # c0
+                ]
+                upper = [
+                    abs(self.max_abs_A.get()),
+                    abs(self.max_abs_A.get()),
+                    np.inf,
+                    np.inf,
+                    np.inf
+                ]
+
+                popt, pcov = curve_fit(f, xm, ym, p0=p0, bounds=(lower, upper), maxfev=20000)
+
+                # Store in the same “main” fields (so your table/labels still work),
+                # plus keep the asymmetry term.
+                c_sym, c_asym, B_res, dB, c0 = map(float, popt)
+                fs.A = c_sym
+                fs.c_asym = c_asym
+                fs.x0 = B_res
+                fs.gamma = dB
+                fs.C = c0
+
+                yfit_full = f(fs.x, *popt)
+
+                # uncertainties
+                se = np.sqrt(np.diag(pcov))
+                dof = max(1, xm.size - len(popt))
+                tcrit = student_t.ppf(0.975, dof)
+                unc = tcrit * se
+                fs.A_unc, fs.c_asym_unc, fs.x0_unc, fs.gamma_unc = float(unc[0]), float(unc[1]), float(unc[2]), float(unc[3])
+
+            fs.R2 = float(r2(fs.y, yfit_full))
 
         except Exception as e:
             messagebox.showerror("Fit failed", f"{fs.file_name}\n\n{e}")
@@ -660,10 +737,20 @@ class FMRFitApp(tk.Tk):
             if fs.A is not None:
                 f = MODEL_FUNCS.get(fs.model, lorentz)
                 xx = np.linspace(fs.x.min(), fs.x.max(), 1500)
-                yy = f(xx, fs.A, fs.x0, fs.gamma, fs.C)
+                is_asym = fs.model in (
+                    "Assymetric Lorentz (absorption)",
+                    "Derivative of assymetric Lorentz (dispersion-like)",
+                )
+
+                if is_asym:
+                    c_asym = 0.0 if fs.c_asym is None else fs.c_asym
+                    yy = f(xx, fs.A, c_asym, fs.x0, fs.gamma, fs.C)
+                    resid = fs.y - f(fs.x, fs.A, c_asym, fs.x0, fs.gamma, fs.C)
+                else:
+                    yy = f(xx, fs.A, fs.x0, fs.gamma, fs.C)
+                    resid = fs.y - f(fs.x, fs.A, fs.x0, fs.gamma, fs.C)
                 self.ax_main.plot(xx, yy, label="Fit")
                 self.ax_main.axvline(fs.x0, linestyle="--", alpha=0.6, label="Resonance")
-                resid = fs.y - f(fs.x, fs.A, fs.x0, fs.gamma, fs.C)
                 self.ax_res.plot(fs.x, resid, ".", ms=3)
                 self.ax_res.axhline(0, ls="--", alpha=0.5)
                 r2txt = f"{fs.R2:.4f}" if fs.R2 is not None else "—"
