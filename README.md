@@ -1,3 +1,6 @@
+
+<img width="1536" height="1024" alt="ChatGPT Image Dec 12, 2025, 01_23_58 PM" src="https://github.com/user-attachments/assets/7bbdf718-076b-4037-9c10-e852b6a10de1" />
+
 # FMR-analysis
 This repo is for analysing FMR data taken at MIT. The code load the data from the text files with frequency in name in form of fXY and fit Lorentzian function. Outputs are linewidth, amplitude and position of the resonance
 
