@@ -59,10 +59,10 @@ def dlorentz_asym_dB(B, c_sym, c_asym, B_res, dB, C):
     return C + d_sym + d_asym
 
 MODEL_FUNCS = {
+        "Derivative of assymetric Lorentz (dispersion-like)": dlorentz_asym_dB,
+    "Assymetric Lorentz (absorption)": lorentz_asym,
     "Derivative of Lorentz (dispersion-like)": dlorentz_dx,
     "Lorentz (absorption)": lorentz,
-    "Derivative of assymetric Lorentz (dispersion-like)": dlorentz_asym_dB,
-    "Assymetric Lorentz (absorption)": lorentz_asym,
 }
 
 # =========================
