@@ -100,6 +100,67 @@ def read_two_column_txt_bytes(file_bytes: bytes):
     y = data[:, 1].astype(float)
     return x, y
 
+# Read new sweep file format
+def read_csv_sweep_bytes(file_bytes: bytes):
+    """
+    Reads either:
+      (A) legacy 2-col CSV: x,y
+      (B) new 4-col CSV: Power(dBm), Frequency(MHz), Field(Oe), Voltage(V)
+
+    Returns a dict:
+      {
+        "kind": "legacy" or "pf_sweep",
+        "data": ...
+      }
+    """
+    raw = file_bytes.decode(errors="ignore")
+    lines = [ln for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        raise ValueError("Empty file")
+
+    # Try to detect header and columns
+    header = lines[0].lower().replace(" ", "")
+    has_power = "power" in header and "frequency" in header and "field" in header
+
+    # Strategy:
+    # - If it looks like the new format, parse as dataframe with 4 columns.
+    # - Else fall back to your existing 2-col loader.
+    if has_power:
+        # Use pandas for robustness (commas, header, scientific notation)
+        df = pd.read_csv(io.StringIO("\n".join(lines)))
+        # Normalize column names
+        df.columns = [c.strip().lower() for c in df.columns]
+
+        # Expected columns (case-insensitive)
+        # "power (dbm)", "frequency (mhz)", "field (oe)", "voltage (v)"
+        # We’ll match by startswith to tolerate slight variations.
+        def find_col(prefix):
+            for c in df.columns:
+                if c.startswith(prefix):
+                    return c
+            raise ValueError(f"Missing column starting with '{prefix}'")
+
+        cP = find_col("power")
+        cF = find_col("frequency")
+        cH = find_col("field")
+        cV = find_col("voltage")
+
+        # Convert to numeric
+        for c in (cP, cF, cH, cV):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=[cP, cF, cH, cV])
+
+        # Return in canonical names
+        return {
+            "kind": "pf_sweep",
+            "df": df.rename(columns={cP: "power_dbm", cF: "freq_mhz", cH: "field_oe", cV: "voltage_v"})
+        }
+
+    # Legacy fallback:
+    x, y = read_two_column_txt_bytes(file_bytes)
+    return {"kind": "legacy", "x": x, "y": y}
+
+
 def auto_initial_guess(x: np.ndarray, y: np.ndarray, model_name: str):
     C = float(np.median(y))
     y0 = y - C
@@ -143,26 +204,26 @@ class FitState:
     file_name: str
     x: np.ndarray
     y: np.ndarray
-    mask: np.ndarray        # True = include in fit; False = excluded
+    mask: np.ndarray
     model: str
     freq_GHz: float
-    A_init: float
-    x0_init: float
-    gamma_init: float
-    C_init: float
+    power_dBm: float = float("nan")   # NEW
+    A_init: float = 0.0
+    x0_init: float = 0.0
+    gamma_init: float = 0.0
+    C_init: float = 0.0
     c_asym_init: float = 0.0
     c_asym: Optional[float] = None
     c_asym_unc: Optional[float] = None
-    # results
     A: Optional[float] = None
     x0: Optional[float] = None
     gamma: Optional[float] = None
     C: Optional[float] = None
     R2: Optional[float] = None
-    # Uncertainties (95%): single ± values
     A_unc: Optional[float] = None
     x0_unc: Optional[float] = None
     gamma_unc: Optional[float] = None
+
 
 # =========================
 #   MAIN APP
@@ -316,18 +377,29 @@ class FMRFitApp(tk.Tk):
 
         ttk.Label(right, text="Tip: Use area selection to (un)mask many points at once.").pack(anchor="w", pady=8)
 
+        self.export_mode = tk.StringVar(value="Long table (one row per fit)")
+        ttk.Label(act, text="Export view:").pack(anchor="w", pady=(6, 0))
+        ttk.OptionMenu(
+            act, self.export_mode, self.export_mode.get(),
+            "Long table (one row per fit)",
+            "Pivot: power sweep (rows=power, cols=freq)",
+            "Pivot: frequency sweep (rows=freq, cols=power)",
+        ).pack(fill="x", pady=2)
+
+
     def _build_bottom_table(self):
         bottom = ttk.Frame(self)
         bottom.pack(side="bottom", fill="both", padx=8, pady=8, expand=True)
 
         ttk.Label(bottom, text="Fitted parameters table (editable; scrollable):").pack(anchor="w")
         cols = (
-            "file", "frequency_GHz",
+            "file", "frequency_GHz", "power_dBm",
             "amplitude", "amplitude_unc",
             "resonance_field", "resonance_field_unc",
             "linewidth_FWHM", "linewidth_FWHM_unc",
             "offset", "R2", "model"
         )
+
         tree_frame = ttk.Frame(bottom); tree_frame.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
         for c in cols:
@@ -349,28 +421,98 @@ class FMRFitApp(tk.Tk):
         )
         if not paths:
             return
+
+        created_any = False
+
         for p in paths:
             try:
                 with open(p, "rb") as fh:
-                    x, y = read_two_column_txt_bytes(fh.read())
+                    parsed = read_csv_sweep_bytes(fh.read())
+
                 fname = p.split("/")[-1].split("\\")[-1]
-                freq = parse_frequency_from_name(fname)
-                if freq is None: freq = float("nan")
-                model = list(MODEL_FUNCS.keys())[0]
-                A0, x00, g0, C0 = auto_initial_guess(x, y, model)
-                mask = np.ones_like(x, dtype=bool)
-                self.fits[p] = FitState(
-                    file_path=p, file_name=fname, x=x, y=y, mask=mask,
-                    model=model, freq_GHz=freq,
-                    A_init=A0, x0_init=x00, gamma_init=g0, C_init=C0, c_asym_init=0.0
-                )
+
+                if parsed["kind"] == "legacy":
+                    x, y = parsed["x"], parsed["y"]
+                    freq = parse_frequency_from_name(fname)
+                    if freq is None:
+                        freq = float("nan")
+
+                    model = list(MODEL_FUNCS.keys())[0]
+                    A0, x00, g0, C0 = auto_initial_guess(x, y, model)
+                    mask = np.ones_like(x, dtype=bool)
+
+                    key = p  # legacy key
+                    self.fits[key] = FitState(
+                        file_path=p,
+                        file_name=fname,
+                        x=x, y=y, mask=mask,
+                        model=model,
+                        freq_GHz=freq,
+                        power_dBm=float("nan"),
+                        A_init=A0, x0_init=x00, gamma_init=g0, C_init=C0,
+                        c_asym_init=0.0
+                    )
+                    created_any = True
+
+                else:
+                    # NEW multi-sweep format
+                    df = parsed["df"]
+
+                    # group by power and frequency
+                    # Note: use round to avoid float weirdness from instrument output
+                    df["power_dbm_r"] = df["power_dbm"].round(6)
+                    df["freq_mhz_r"] = df["freq_mhz"].round(6)
+
+                    model = list(MODEL_FUNCS.keys())[0]
+
+                    for (p_dbm, f_mhz), g in df.groupby(["power_dbm_r", "freq_mhz_r"], sort=True):
+                        x = g["field_oe"].to_numpy(dtype=float)
+                        y = g["voltage_v"].to_numpy(dtype=float)
+
+                        # sort by field (important for plotting + gradients)
+                        order = np.argsort(x)
+                        x = x[order]
+                        y = y[order]
+
+                        if x.size < 4:
+                            continue
+
+                        freq_GHz = float(f_mhz) / 1000.0
+                        power_dBm = float(p_dbm)
+
+                        # make a nice display name in the file list + plot title
+                        sweep_name = f"{fname} | P={power_dBm:.1f} dBm | f={freq_GHz:.6g} GHz"
+
+                        A0, x00, g0, C0 = auto_initial_guess(x, y, model)
+                        mask = np.ones_like(x, dtype=bool)
+
+                        # unique key per sweep
+                        key = f"{p}::P={power_dBm:.6f}::fMHz={float(f_mhz):.6f}"
+
+                        self.fits[key] = FitState(
+                            file_path=p,
+                            file_name=sweep_name,
+                            x=x, y=y, mask=mask,
+                            model=model,
+                            freq_GHz=freq_GHz,
+                            power_dBm=power_dBm,
+                            A_init=A0, x0_init=x00, gamma_init=g0, C_init=C0,
+                            c_asym_init=0.0
+                        )
+                        created_any = True
+
             except Exception as e:
                 messagebox.showerror("Load failed", f"{p}\n\n{e}")
+
+        if not created_any:
+            return
+
         self._refresh_file_list()
         if self.selected_key is None and self.fits:
             self._select_first()
         self._refresh_table()
         self._update_plot_and_labels()
+
 
     def remove_selected(self):
         key = self.selected_key
@@ -529,6 +671,53 @@ class FMRFitApp(tk.Tk):
         except Exception as e:
             messagebox.showerror("Fit failed", f"{fs.file_name}\n\n{e}")
 
+    def _export_dataframe(self) -> pd.DataFrame:
+        rows = self._row_dicts()
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows).drop(columns=["_key"])
+
+        mode = self.export_mode.get()
+
+        if mode == "Long table (one row per fit)":
+            return df
+
+        # For pivots we choose what to pivot. You can pivot any param;
+        # default: resonance_field and linewidth; but easiest is to export multiple
+        # sheets—CSV can’t, so we’ll export one pivot at a time.
+        # Here: we pivot resonance_field as the main value. You can change.
+        value_col = "resonance_field"
+
+        # Make sure power/frequency are clean for indexing
+        df["frequency_GHz"] = pd.to_numeric(df["frequency_GHz"], errors="coerce")
+        df["power_dBm"] = pd.to_numeric(df["power_dBm"], errors="coerce")
+
+        if mode == "Pivot: power sweep (rows=power, cols=freq)":
+            pivot = df.pivot_table(
+                index="power_dBm",
+                columns="frequency_GHz",
+                values=value_col,
+                aggfunc="mean"
+            ).sort_index(axis=0).sort_index(axis=1)
+            pivot = pivot.reset_index()
+            pivot.columns = [str(c) for c in pivot.columns]
+            return pivot
+
+        if mode == "Pivot: frequency sweep (rows=freq, cols=power)":
+            pivot = df.pivot_table(
+                index="frequency_GHz",
+                columns="power_dBm",
+                values=value_col,
+                aggfunc="mean"
+            ).sort_index(axis=0).sort_index(axis=1)
+            pivot = pivot.reset_index()
+            pivot.columns = [str(c) for c in pivot.columns]
+            return pivot
+
+        return df
+
+
     # -------- Masking (click + area) --------
     def _on_plot_click(self, event):
         if not self.click_masking_enabled.get():
@@ -624,12 +813,13 @@ class FMRFitApp(tk.Tk):
     # -------- Table handling --------
     def _row_dicts(self):
         out = []
-        for fs in self.fits.values():
+        for k, fs in self.fits.items():
             if fs.A is None:
                 continue
             out.append({
                 "file": fs.file_name,
                 "frequency_GHz": fs.freq_GHz,
+                "power_dBm": fs.power_dBm,
                 "amplitude": fs.A,
                 "amplitude_unc": fs.A_unc,
                 "resonance_field": fs.x0,
@@ -639,9 +829,11 @@ class FMRFitApp(tk.Tk):
                 "offset": fs.C,
                 "R2": fs.R2,
                 "model": fs.model,
-                "_key": fs.file_path,
+                "_key": k,   # UNIQUE key for this sweep
             })
         return out
+
+
 
     def _refresh_table(self):
         for item in self.tree.get_children():
@@ -702,27 +894,31 @@ class FMRFitApp(tk.Tk):
         self._update_plot_and_labels()
 
     def copy_csv_clipboard(self):
-        rows = self._row_dicts()
-        if not rows:
+        df = self._export_dataframe()
+        if df.empty:
             messagebox.showinfo("Copy CSV", "No fitted results to copy."); return
-        df = pd.DataFrame(rows).drop(columns=["_key"])
         csv_text = df.to_csv(index=False)
         self.clipboard_clear(); self.clipboard_append(csv_text)
-        messagebox.showinfo("Copy CSV", "Results copied to clipboard.")
+        messagebox.showinfo("Copy CSV", "Export copied to clipboard.")
+
 
     def export_csv(self):
-        rows = self._row_dicts()
-        if not rows:
+        df = self._export_dataframe()
+        if df.empty:
             messagebox.showinfo("Save CSV", "No fitted results to save."); return
-        df = pd.DataFrame(rows).drop(columns=["_key"])
-        path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                            filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
-        if not path: return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")]
+        )
+        if not path:
+            return
         try:
             df.to_csv(path, index=False)
             messagebox.showinfo("Save CSV", f"Saved:\n{path}")
         except Exception as e:
             messagebox.showerror("Save CSV failed", str(e))
+
 
     # -------- Plot + labels --------
     def _update_plot_and_labels(self):
