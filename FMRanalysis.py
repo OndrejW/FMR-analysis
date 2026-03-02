@@ -374,6 +374,7 @@ class FMRFitApp(tk.Tk):
         act.pack(fill="x", pady=10)
         ttk.Button(act, text="Copy table to clipboard", command=self.copy_csv_clipboard).pack(fill="x", pady=2)
         ttk.Button(act, text="Save CSV…", command=self.export_csv).pack(fill="x", pady=2)
+        ttk.Button(act, text="Copy selected data to clipboard", command=self.copy_selected_data_clipboard).pack(fill="x", pady=2)
 
         ttk.Label(right, text="Tip: Use area selection to (un)mask many points at once.").pack(anchor="w", pady=8)
 
@@ -385,6 +386,7 @@ class FMRFitApp(tk.Tk):
             "Pivot: power sweep (rows=power, cols=freq)",
             "Pivot: frequency sweep (rows=freq, cols=power)",
         ).pack(fill="x", pady=2)
+        
 
 
     def _build_bottom_table(self):
@@ -900,6 +902,36 @@ class FMRFitApp(tk.Tk):
         csv_text = df.to_csv(index=False)
         self.clipboard_clear(); self.clipboard_append(csv_text)
         messagebox.showinfo("Copy CSV", "Export copied to clipboard.")
+
+    def copy_selected_data_clipboard(self):
+        """Copy the selected sweep's raw data to the clipboard as CSV:
+           first column = field, second column = signal
+        """
+        fs = self._get_selected()
+        if not fs:
+            messagebox.showinfo("Copy data", "No file/sweep selected.")
+            return
+
+        # Use the array order as-is (same order used for plotting).
+        # If you prefer only unmasked points, change to fs.x[fs.mask], fs.y[fs.mask]
+        x = np.asarray(fs.x)
+        y = np.asarray(fs.y)
+
+        if x.size == 0:
+            messagebox.showinfo("Copy data", "Selected sweep contains no data.")
+            return
+
+        # Build CSV text (field,signal)
+        buf = io.StringIO()
+        # small DataFrame to ensure robust CSV formatting (handles floats nicely)
+        df = pd.DataFrame({"field": x, "signal": y})
+        df.to_csv(buf, index=False, float_format="%.12g")
+        csv_text = buf.getvalue()
+
+        # Put into system clipboard
+        self.clipboard_clear()
+        self.clipboard_append(csv_text)
+        messagebox.showinfo("Copy data", f"Copied {len(x)} rows (field,signal) to clipboard.")
 
 
     def export_csv(self):
